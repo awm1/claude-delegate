@@ -1,0 +1,149 @@
+#!/usr/bin/env bash
+# claude-delegate dispatcher. See SKILL.md and backends/CONTRACT.md.
+#
+#   delegate check
+#   delegate new <branch> [<base-ref>]      create + provision a worktree, print its path
+#   delegate provision <worktree>
+#   delegate run <worktree> <task-file>     foreground; caller backgrounds it
+#   delegate resume <worktree> <followup-file>
+#   delegate stop <worktree>
+#   delegate progress <output-file> [--new] follow an event stream as readable lines
+#   delegate prompt <task-file>             print the assembled prompt (dry run)
+#   delegate config                         print the effective configuration
+set -euo pipefail
+
+SKILL_DIR=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)
+
+die() { echo "delegate: $*" >&2; exit 1; }
+
+# --- configuration ---------------------------------------------------------------
+main_repo_guess() {
+    local common
+    common=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || return 0
+    dirname "$common"
+}
+
+guess=$(main_repo_guess)
+config_file=${DELEGATE_CONFIG:-${guess:+$guess/.claude/delegate.local.env}}
+if [ -n "${config_file:-}" ] && [ -f "$config_file" ]; then
+    # Variables already set in the environment win over the config file.
+    env_overrides=""
+    for v in $(compgen -e | grep '^DELEGATE_' || true); do
+        env_overrides+="$(declare -p "$v");"
+    done
+    # shellcheck disable=SC1090
+    . "$config_file"
+    eval "$env_overrides"
+fi
+
+DELEGATE_BACKEND=${DELEGATE_BACKEND:-codex}
+DELEGATE_MAIN_REPO=${DELEGATE_MAIN_REPO:-$guess}
+DELEGATE_WORKTREE_ROOT=${DELEGATE_WORKTREE_ROOT:-.claude/worktrees}
+DELEGATE_DISABLE_MCP=${DELEGATE_DISABLE_MCP:-}
+DELEGATE_PROVISION_HOOKS=${DELEGATE_PROVISION_HOOKS:-}
+DELEGATE_PROFILE=${DELEGATE_PROFILE:-}
+DELEGATE_EXTRA_ARGS=${DELEGATE_EXTRA_ARGS:-}
+DELEGATE_STATE_DIR=${DELEGATE_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/claude-delegate}
+# Hooks and adapters run as subprocesses and read their own DELEGATE_* variables.
+# shellcheck disable=SC2046
+export SKILL_DIR $(compgen -v | grep '^DELEGATE_')
+
+[ -n "$DELEGATE_MAIN_REPO" ] || die "DELEGATE_MAIN_REPO not set and not inside a git repo"
+
+if [ -n "$DELEGATE_PROFILE" ] && [ "${DELEGATE_PROFILE#/}" = "$DELEGATE_PROFILE" ]; then
+    DELEGATE_PROFILE="$SKILL_DIR/$DELEGATE_PROFILE"
+fi
+
+adapter="$SKILL_DIR/backends/$DELEGATE_BACKEND.sh"
+[ -f "$adapter" ] || die "no adapter backends/$DELEGATE_BACKEND.sh (see backends/CONTRACT.md)"
+# shellcheck disable=SC1090
+. "$adapter"
+
+# --- helpers ---------------------------------------------------------------------
+state_dir_for() {
+    local wt
+    wt=$(cd "$1" && pwd) || die "worktree $1 does not exist"
+    local dir="$DELEGATE_STATE_DIR/$(basename "$wt")"
+    mkdir -p "$dir"
+    echo "$dir"
+}
+
+profile_section() {
+    # Print the body of "## <heading>" from the profile, up to the next "## ".
+    [ -n "$DELEGATE_PROFILE" ] && [ -f "$DELEGATE_PROFILE" ] || return 0
+    awk -v h="## $1" '$0 == h {on=1; next} /^## / {on=0} on' "$DELEGATE_PROFILE"
+}
+
+assemble_prompt() {
+    cat "$SKILL_DIR/prompts/preamble.md"
+    local extra
+    extra=$(profile_section "Prompt additions")
+    if [ -n "$extra" ]; then
+        printf '\n## Project rules\n%s\n' "$extra"
+    fi
+    printf '\n## Task\n\n'
+    cat "$1"
+}
+
+# --- commands --------------------------------------------------------------------
+cmd=${1:-}; shift || true
+case "$cmd" in
+    check)
+        echo "backend: $DELEGATE_BACKEND ($adapter)"
+        echo "main repo: $DELEGATE_MAIN_REPO"
+        echo "profile: ${DELEGATE_PROFILE:-<none>}"
+        git -C "$DELEGATE_MAIN_REPO" check-ignore -q "$DELEGATE_WORKTREE_ROOT/x" \
+            || die "$DELEGATE_WORKTREE_ROOT is not gitignored in $DELEGATE_MAIN_REPO"
+        backend_check
+        ;;
+    config)
+        for v in DELEGATE_BACKEND DELEGATE_MAIN_REPO DELEGATE_WORKTREE_ROOT DELEGATE_DISABLE_MCP \
+                 DELEGATE_PROVISION_HOOKS DELEGATE_PROFILE DELEGATE_EXTRA_ARGS DELEGATE_STATE_DIR; do
+            printf '%s=%q\n' "$v" "${!v}"
+        done
+        echo "# config file: ${config_file:-<none>}"
+        ;;
+    new)
+        branch=${1:?branch name required}; base=${2:-HEAD}
+        wt="$DELEGATE_MAIN_REPO/$DELEGATE_WORKTREE_ROOT/$branch"
+        git -C "$DELEGATE_MAIN_REPO" worktree add -q "$wt" -b "$branch" "$base" >&2
+        "$0" provision "$wt" >&2
+        echo "$wt"
+        ;;
+    provision)
+        wt=$(cd "${1:?worktree required}" && pwd)
+        for hook in $DELEGATE_PROVISION_HOOKS; do
+            script="$SKILL_DIR/provision.d/$hook.sh"
+            [ -f "$script" ] || die "unknown provision hook $hook"
+            echo "provision: $hook" >&2
+            (cd "$wt" && bash "$script")
+        done
+        ;;
+    run|resume)
+        wt=$(cd "${1:?worktree required}" && pwd); task=${2:?prompt file required}
+        sd=$(state_dir_for "$wt")
+        if [ "$cmd" = run ]; then
+            assemble_prompt "$task" > "$sd/prompt.md"
+        else
+            cp "$task" "$sd/prompt.md"
+        fi
+        echo $$ > "$sd/pid"
+        "backend_$cmd" "$wt" "$sd/prompt.md"
+        ;;
+    stop)
+        wt=$(cd "${1:?worktree required}" && pwd)
+        backend_stop "$wt" "$(state_dir_for "$wt")/pid"
+        ;;
+    progress)
+        file=${1:?output file required}
+        start="+1"; [ "${2:-}" = "--new" ] && start="0"
+        tail -n "$start" -f "$file" | backend_progress_filter
+        ;;
+    prompt)
+        assemble_prompt "${1:?task file required}"
+        ;;
+    *)
+        sed -n '2,13p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+        [ -z "$cmd" ] || exit 1
+        ;;
+esac
